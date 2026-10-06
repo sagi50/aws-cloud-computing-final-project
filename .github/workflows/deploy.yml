@@ -1,0 +1,272 @@
+name: Final Project CI/CD
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-north-1
+  AWS_ACCOUNT_ID: "470451076057"
+
+  VISITS_REPOSITORY: final-project-visits-service
+  STATS_REPOSITORY: final-project-stats-service
+
+  VISITS_INSTANCE_ID: i-0bb34400c221cfa8b
+  STATS_INSTANCE_ID: i-036e9637fd4e36726
+
+  VISITS_PRIVATE_IP: 10.0.11.109
+
+  DB_HOST: final-project-db.crcee4gea45k.eu-north-1.rds.amazonaws.com
+  DB_NAME: finaldb
+  DB_USER: finaladmin
+  DB_PASSWORD_PARAMETER: /final-project/db-password
+
+  FRONTEND_BUCKET: final-project-frontend-470451076057-eu-north-1
+  CLOUDFRONT_DISTRIBUTION_ID: E2HL0IOH09FI7A
+  CLOUDFRONT_ORIGIN: http://d4u4g8xe3b280.cloudfront.net
+
+  ALB_URL: http://final-project-alb-739835223.eu-north-1.elb.amazonaws.com
+
+jobs:
+
+  detect-changes:
+    name: Detect changed workloads
+    runs-on: ubuntu-latest
+
+    outputs:
+      visits: ${{ steps.filter.outputs.visits }}
+      stats: ${{ steps.filter.outputs.stats }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            visits:
+              - 'workloads/visits-service/**'
+            stats:
+              - 'workloads/stats-service/**'
+            frontend:
+              - 'workloads/frontend/**'
+
+
+  deploy-visits:
+    name: Build and deploy visits-service
+    needs: detect-changes
+    if: needs.detect-changes.outputs.visits == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::470451076057:role/final-project-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+          | docker login \
+            --username AWS \
+            --password-stdin \
+            "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+      - name: Build visits-service image
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -t "$VISITS_REPOSITORY:latest" \
+            workloads/visits-service
+
+      - name: Tag visits-service image
+        run: |
+          docker tag \
+            "$VISITS_REPOSITORY:latest" \
+            "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$VISITS_REPOSITORY:latest"
+
+      - name: Push visits-service image to ECR
+        run: |
+          docker push \
+            "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$VISITS_REPOSITORY:latest"
+
+      - name: Create visits deploy parameters
+        run: |
+          cat > visits-ssm.json <<EOF
+          {
+            "commands": [
+              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com",
+              "docker pull $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$VISITS_REPOSITORY:latest",
+              "docker rm -f visits-service || true",
+              "DB_PASSWORD=\$(aws ssm get-parameter --name $DB_PASSWORD_PARAMETER --with-decryption --query Parameter.Value --output text)",
+              "docker run -d --name visits-service --restart unless-stopped -p 8080:8080 -e DB_HOST=$DB_HOST -e DB_NAME=$DB_NAME -e DB_USER=$DB_USER -e DB_PASSWORD=\$DB_PASSWORD -e PGSSLMODE=require -e ALLOWED_ORIGIN=$CLOUDFRONT_ORIGIN $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$VISITS_REPOSITORY:latest",
+              "sleep 8",
+              "curl -f http://localhost:8080/health"
+            ]
+          }
+          EOF
+
+      - name: Deploy visits-service through SSM
+        id: deploy
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$VISITS_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file://visits-ssm.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for visits deployment
+        run: |
+          aws ssm wait command-executed \
+            --command-id "${{ steps.deploy.outputs.command_id }}" \
+            --instance-id "$VISITS_INSTANCE_ID"
+
+      - name: Verify visits deployment
+        run: |
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.deploy.outputs.command_id }}" \
+            --instance-id "$VISITS_INSTANCE_ID" \
+            --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
+            --output json
+
+
+  deploy-stats:
+    name: Build and deploy stats-service
+    needs: detect-changes
+    if: needs.detect-changes.outputs.stats == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::470451076057:role/final-project-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" \
+          | docker login \
+            --username AWS \
+            --password-stdin \
+            "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+      - name: Build stats-service image
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            -t "$STATS_REPOSITORY:latest" \
+            workloads/stats-service
+
+      - name: Tag stats-service image
+        run: |
+          docker tag \
+            "$STATS_REPOSITORY:latest" \
+            "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$STATS_REPOSITORY:latest"
+
+      - name: Push stats-service image to ECR
+        run: |
+          docker push \
+            "$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$STATS_REPOSITORY:latest"
+
+      - name: Create stats deploy parameters
+        run: |
+          cat > stats-ssm.json <<EOF
+          {
+            "commands": [
+              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com",
+              "docker pull $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$STATS_REPOSITORY:latest",
+              "docker rm -f stats-service || true",
+              "docker run -d --name stats-service --restart unless-stopped -p 8081:8081 -e VISITS_SERVICE_URL=http://$VISITS_PRIVATE_IP:8080 -e ALLOWED_ORIGIN=$CLOUDFRONT_ORIGIN $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$STATS_REPOSITORY:latest",
+              "sleep 8",
+              "curl -f http://localhost:8081/health",
+              "curl -f http://localhost:8081/stats"
+            ]
+          }
+          EOF
+
+      - name: Deploy stats-service through SSM
+        id: deploy
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$STATS_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file://stats-ssm.json \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for stats deployment
+        run: |
+          aws ssm wait command-executed \
+            --command-id "${{ steps.deploy.outputs.command_id }}" \
+            --instance-id "$STATS_INSTANCE_ID"
+
+      - name: Verify stats deployment
+        run: |
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.deploy.outputs.command_id }}" \
+            --instance-id "$STATS_INSTANCE_ID" \
+            --query "{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}" \
+            --output json
+
+
+  deploy-frontend:
+    name: Deploy frontend
+    needs: detect-changes
+    if: needs.detect-changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::470451076057:role/final-project-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prepare frontend
+        run: |
+          mkdir -p deploy-frontend
+
+          cp workloads/frontend/index.html deploy-frontend/index.html
+
+          sed -i \
+            "s|__API_BASE_URL__|$ALB_URL|g" \
+            deploy-frontend/index.html
+
+          grep "const API_BASE" deploy-frontend/index.html
+
+      - name: Upload frontend to S3
+        run: |
+          aws s3 sync \
+            deploy-frontend/ \
+            "s3://$FRONTEND_BUCKET/" \
+            --delete
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "/*"

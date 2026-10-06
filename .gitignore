@@ -1,3 +1,14 @@
 .DS_Store
 __pycache__/
 *.pyc
+bucket-policy.json
+cloudfront-config.json
+current-index.html
+oac-config.json
+stats-deploy.json
+stats-update.json
+visits-deploy.json
+visits-update.json
+workloads/frontend/index.deploy.html
+github-actions-policy.json
+github-trust-policy.json
